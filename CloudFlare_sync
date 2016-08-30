@@ -1,0 +1,539 @@
+#!/bin/bash
+
+cd /etc/powerdns/cloudflare_sync
+
+## Configuration
+
+mysqluser=`grep gmysql-user /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2`
+mysqlpass=`grep gmysql-password /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2`
+apikey="YOUR CLOUDFLARE API GOES HERE"
+apimail="YOUR CLOUDFLARE LOGIN EMAIL GOES HERE"
+syncdelay="60"
+cfservicemode=0 # 0 - Normal, 1 - CF Protected
+excludelist="TYPE DOMAINS TO EXCLUDE SYNC HERE. SPACE SEPARATED"
+
+#Internal Configuration, Do not EDIT
+changesmade=""
+## Functions
+
+function get_domains_list {
+        echo "SELECT name FROM domains;" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d'
+}
+
+
+function check_domain_existance {
+        domain=$1
+        domainstatus=""
+        domaincheck=""
+        domaincheck=$(curl -X GET "https://api.cloudflare.com/client/v4/zones?name=$domain" -H "X-Auth-Email: $apimail" -H "X-Auth-Key: $apikey" -H "Content-Type: application/json" 2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l)
+
+        if [ `echo "$domaincheck" | wc -l` -lt '10' ]; then
+                domainstatus="NOT EXIST"
+                echo "CloudFlare status of domain: $domain is : $domainstatus"
+                returncode=1
+        else
+                domainstatus="OK"
+                returncode=0
+        fi
+        return $returncode
+}
+
+function get_record_id {
+        domain="$1"
+        searchrecord="$2"
+        searchtype="$3"
+
+        searchquery=$(curl https://www.cloudflare.com/api_json.html \
+                                  -d 'a=rec_load_all' \
+                                  -d "tkn=$apikey" \
+                                  -d "email=$apimail" \
+                                  -d "z=$domain" \
+                                  -d "name=$searchrecord" \
+                                  2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l
+                                )
+
+        if [ "x`echo $searchrecord | grep ^\*`" != "x" ]; then
+                getobjnr=`echo "$searchquery" | grep \"name\" | grep \"\\\\$searchrecord\"$ | cut -d',' -f4`
+        else
+                getobjnr=`echo "$searchquery" | grep \"name\" | grep \"$searchrecord\"$ | cut -d',' -f4`
+        fi
+
+
+        if [ "x$getobjnr" == "x" ]; then echo "FATAL EXCEPTION: NO RECORDS FOUND"; return 1; fi
+
+        while read objnr; do
+                typequery=`echo "$searchquery" | grep ",$objnr,\"type\"" | awk '{print $2}'`
+
+                if [ "x`echo $typequery | grep $searchtype`" != "x" ]; then
+                        if [ `echo $typequery | grep $searchtype | wc -l` -gt '1' ]; then
+                                echo WOOOW, I have multiple ID for the same record!!! ABORTING!!! FUCK!!!
+                        else
+                                echo `echo "$searchquery" | grep ,$objnr,\"rec_id\" | awk '{print $2}' | tr -d '"'`
+                        fi
+                fi
+
+        done <<< "$getobjnr"
+
+
+}
+function add_new_domain_records {
+
+        if [ "x$1" != "x" ]; then
+        getndomainid=`echo "SELECT id FROM domains WHERE NAME LIKE '$1';" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+        getnewaddjobs=`echo "SELECT * FROM cf_sync_new WHERE domain_id="$getndomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+        else
+
+        getnewaddjobs=`echo "SELECT * FROM cf_sync_new;" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+        fi
+
+if [ "x$getnewaddjobs" != "x" ]; then
+
+        while read newrecord; do
+
+                record_id=`echo $newrecord | cut -d' ' -f1`
+                domain_id=`echo $newrecord | cut -d' ' -f2`
+                domain_name=`echo "SELECT name FROM domains WHERE id="$domain_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_name=`echo $newrecord | cut -d' ' -f3`
+                record_type=`echo $newrecord | cut -d' ' -f4`
+                record_content=`echo "SELECT content FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_ttl=`echo "SELECT ttl FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_prio=`echo "SELECT prio FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+
+                if [[ "$excludelist" == *"$domain_name"* ]]; then
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ]; then
+                        echo "DELETE FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                else
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ] || [ "x`echo $record_name | egrep -e \"^s1[0-9]{4}" -e "^s[0-4]{1}[0-9]{1,2}\"`" != "x" ]; then
+                        echo "DELETE FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                fi
+
+
+
+                echo "Synchronizing $domain_name records with CloudFlare servers. Syncing NEW record: $record_name $record_type $record_content $record_ttl $record_prio"
+                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
+                                  -d 'a=rec_new' \
+                                  -d "tkn=$apikey" \
+                                  -d "email=$apimail" \
+                                  -d "z=$domain_name" \
+                                  -d "type=$record_type" \
+                                  -d "name=$record_name" \
+                                  -d "content=$record_content" \
+                                  -d "ttl=$record_ttl" \
+                                  -d "service_mode=$cfservicemode" \
+                                  -d "prio=$record_prio" 2>/dev/null
+                                )
+
+                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                        echo Record Added Successfully
+                        echo "DELETE FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                else
+                        echo Record adding FAILED!!!! SEE WHAT IS WRONG:
+                        echo "$statusresult"
+                fi
+
+
+        done <<< "$getnewaddjobs"
+        changesmade="1"
+fi
+}
+
+
+function update_domain_records {
+
+                if [ "x$1" != "x" ]; then
+                getudomainid=`echo "SELECT id FROM domains WHERE NAME LIKE '$1';" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                getnewupdjobs=`echo "SELECT * FROM cf_sync_updated WHERE domain_id="$getudomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                else
+                getnewupdjobs=`echo "SELECT * FROM cf_sync_updated;" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                fi
+
+if [ "x$getnewupdjobs" != "x" ]; then
+
+        while read newrecord; do
+
+                record_id=`echo $newrecord | cut -d' ' -f1`
+                domain_id=`echo $newrecord | cut -d' ' -f2`
+                domain_name=`echo "SELECT name FROM domains WHERE id="$domain_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_name=`echo $newrecord | cut -d' ' -f3`
+                record_type=`echo $newrecord | cut -d' ' -f4`
+                record_content=`echo "SELECT content FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_ttl=`echo "SELECT ttl FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_prio=`echo "SELECT prio FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+
+                if [[ "$excludelist" == *"$domain_name"* ]]; then
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ]; then
+                        echo "DELETE FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                else
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ] || [ "x`echo $record_name | egrep -e \"^s1[0-9]{4}" -e "^s[0-4]{1}[0-9]{1,2}\"`" != "x" ]; then
+                        echo "DELETE FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                fi
+
+                cf_record_id=`get_record_id $domain_name $record_name $record_type`
+
+
+
+                echo "Synchronizing $domain_name records with CloudFlare servers. Syncing UPDATED record $cf_record_id : $record_name $record_type $record_content $record_ttl $record_prio"
+                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
+                                  -d 'a=rec_edit' \
+                                  -d "tkn=$apikey" \
+                                  -d "email=$apimail" \
+                                  -d "id=$cf_record_id" \
+                                  -d "z=$domain_name" \
+                                  -d "type=$record_type" \
+                                  -d "name=$record_name" \
+                                  -d "content=$record_content" \
+                                  -d "ttl=$record_ttl" \
+                                  -d "service_mode=$cfservicemode" \
+                                  -d "prio=$record_prio" 2>/dev/null
+                                )
+
+                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                        echo Record Updated Successfully
+                        echo "DELETE FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                else
+                        echo Record Updating FAILED!!!! SEE WHAT IS WRONG:
+                        echo "$statusresult"
+                fi
+
+
+        done <<< "$getnewupdjobs"
+        changesmade="1"
+fi
+}
+
+function delete_domain_records {
+
+                        if [ "x$1" != "x" ]; then
+                        getddomainid=`echo "SELECT id FROM domains WHERE NAME LIKE '$1';" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                        getdeljobs=`echo "SELECT * FROM cf_sync_deleted WHERE domain_id="$getddomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                        else
+                        getdeljobs=`echo "SELECT * FROM cf_sync_deleted;" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                        fi
+
+if [ "x$getdeljobs" != "x" ]; then
+
+        while read newrecord; do
+
+                record_id=`echo $newrecord | cut -d' ' -f1`
+                domain_id=`echo $newrecord | cut -d' ' -f2`
+                domain_name=`echo "SELECT name FROM domains WHERE id="$domain_id";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                record_name=`echo $newrecord | cut -d' ' -f3`
+                record_type=`echo $newrecord | cut -d' ' -f4`
+
+                if [[ "$excludelist" == *"$domain_name"* ]]; then
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ]; then
+                        echo "DELETE FROM cf_sync_deleted WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                else
+                        if [ "$record_type" == "NS" ] || [ "$record_type" == "SOA" ] || [ "x`echo $record_name | egrep -e \"^s1[0-9]{4}" -e "^s[0-4]{1}[0-9]{1,2}\"`" != "x" ]; then
+                        echo "DELETE FROM cf_sync_deleted WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        continue;
+                        fi
+                fi
+
+                if [ "x$domain_name" == "x" ]; then
+                                domain_name=`echo $record_name | awk -F. '{print $(NF-1)"."$NF}'`
+                                echo HEY - ID OF DOMAIN IS REMOVED FROM DATABASE - POSSIBLY A WHOLE ZONE HAS BEEN REMOVED
+                                echo ALL I CAN DO IS JUST GUES WHAT DOMAIN IS ALL ABOUT!!!
+                                echo Im QUESSING ITs ABOUT: $domain_name
+
+                fi
+
+
+                cf_record_id=`get_record_id $domain_name $record_name $record_type`
+
+
+
+                echo "Synchronizing $domain_name records with CloudFlare servers. Removing Record $cf_record_id : $record_name $record_type"
+                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
+                                  -d 'a=rec_delete' \
+                                  -d "tkn=$apikey" \
+                                  -d "email=$apimail" \
+                                  -d "id=$cf_record_id" \
+                                  -d "z=$domain_name" 2>/dev/null
+                                )
+
+                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                        echo Record Deleted Successfully
+                        echo "DELETE FROM cf_sync_deleted WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                else
+                        echo Record Removal FAILED!!!! SEE WHAT IS WRONG:
+                        echo "$statusresult"
+                fi
+
+
+        done <<< "$getdeljobs"
+        changesmade="1"
+fi
+}
+
+
+
+
+
+function check_domain_synchronization {
+        domain="$1"
+        if [[ "$excludelist" == *"$domain"* ]]; then
+        dig AXFR @localhost $domain >/tmp/testfile
+        else
+        dig AXFR @localhost $domain | egrep -v -e "^s1[0-9]{4}" -e "^s[0-4]{1}[0-9]{1,2}" >/tmp/testfile
+        fi
+        compared=`dns_compare -z $domain --file /tmp/testfile --server bart.ns.cloudflare.com --verbose --ttl false 2>/dev/null | grep -A 3 MIS-MATCH`
+        if [ "x$compared" != "x" ]; then
+        echo "$compared"
+        fi
+}
+
+
+
+function create_cf_domain {
+        domain=$1
+        domainreturn=""
+        domaincreatestatus=$(curl -X POST "https://api.cloudflare.com/client/v4/zones" -H "X-Auth-Email: $apimail" -H "X-Auth-Key: $apikey" -H "Content-Type: application/json" --data "{\"name\":\"$domain\",\"jump_start\":false}" 2>/dev/null)
+
+        if [ `echo $domaincreatestatus | grep "\"success\":false" | wc -l` != '0' ]
+                then
+                echo CREATING THIS DOMAIN IN CLOUDFLARE: FAILED!!! REASON:
+                echo $domaincreatestatus
+                else
+                echo CREATING THIS DOMAIN IN CLOUDFLARE: SUCCESS
+        fi
+}
+
+# Obsluga linii polecen:
+
+if [ "x$1" == "x--help" ]; then
+echo CloudFlare Synchronization Script
+echo
+echo Works without any additional Options
+echo Additional Options Available:
+echo
+echo --help - Shows this help screen
+echo --compare domain.com - Checks domain.com for MIS-MATCHES between our, and CloudFlare server.
+echo --compare-all - Checks all domains for MIS-MATCHES. You can add second parameter for delay time between checks per domain
+echo --check domain.com - Checks if domain.com is properly handled by CF servers
+echo --flush-queue - Removes all pending operations queued in mysql, You can add second parameter with domain name to delete only queue for this domain
+echo --show-queue - Show all pending operations stored in mysql
+echo --add - Runs only adding new Records to CF servers
+echo --update - Runs only updating Records on CF servers
+echo --delete - Runs only deletion of Records in CF servers
+echo --restore-all - Copies all PowerDNS records to sync table for resync
+echo --restore-domain domain.com- Restore records of specified domain
+echo --specified domain.com - Do all the tasks for one domain only, specified one, as a second parameter
+echo
+exit 0
+fi
+
+
+if [ "x$1" == "x--flush-queue" ]; then
+echo " "
+echo " "
+echo "Are You sure U really want to flush all pending operations? (yes/no)"
+read ODP
+        if [ "$ODP" != "yes" ]; then
+                echo Not doing anything. Bye
+                exit 0
+        else
+                if [ "x$2" != "x" ]; then
+                        getdomainid=`echo "SELECT id FROM domains WHERE NAME LIKE '$2';" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                        echo Flushing my queues in MYSQL database for domain $2
+                        echo "DELETE FROM cf_sync_new WHERE domain_id="$getdomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo "DELETE FROM cf_sync_updated WHERE domain_id="$getdomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo "DELETE FROM cf_sync_deleted WHERE domain_id="$getdomainid";" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo Done
+                        exit 0
+                else
+
+                        echo Flushing my queues in MYSQL database
+                        echo "DELETE FROM cf_sync_new;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo "DELETE FROM cf_sync_updated;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo "DELETE FROM cf_sync_deleted;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo Done
+                        exit 0
+                fi
+        fi
+fi
+
+if [ "x$1" == "x--show-queue" ]; then
+                echo My queues in MYSQL database:
+                echo "SELECT * FROM cf_sync_new;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                echo "SELECT * FROM cf_sync_updated;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                echo "SELECT * FROM cf_sync_deleted;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                echo Done
+                exit 0
+fi
+
+
+if [ "x$1" == "x--compare" ]; then
+        if [ "x$2" != "x" ]; then
+        echo Running Compare operation for $2 domain. Will Display something only if Mis-Match will be found.
+        check_domain_synchronization $2
+        exit 0
+        else
+        echo You must specify domain after parameter name
+        exit 1
+        fi
+fi
+
+if [ "x$1" == "x--compare-all" ]; then
+        comparesleeptime=0
+        if [ "x$2" != "x" ]; then
+        comparesleeptime=$2
+        fi
+        for domain in `get_domains_list`; do
+                check_domain_synchronization $domain
+                sleep $comparesleeptime;
+        done
+
+        exit 0
+fi
+
+
+if [ "x$1" == "x--restore-all" ]; then
+echo " "
+echo " "
+echo "Are You sure U really want to AGAIN send all records to CloudFlare? (yes/no)"
+read ODP
+        if [ "$ODP" != "yes" ]; then
+                echo Not doing anything. Bye
+                exit 0
+        else
+                echo Copying all PowerDNS records to Cloudflare Sync Table
+                echo "insert into cf_sync_new (domain_id,name,type,content,ttl,prio) select domain_id,name,type,content,ttl,prio from records;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                echo Should I now run a sync of this records? If not they will be synced at next script run. You will get e-mail with status. If yes - I will do this immediately, and print here on screen.
+                echo "(yes/no)"
+                read ODP2
+                if [ "$ODP2" != "yes" ]; then
+                        echo Bye.
+                        exit 0
+                else
+                        add_new_domain_records
+                fi
+        fi
+fi
+
+
+if [ "x$1" == "x--restore-domain" ]; then
+        if [ "x$2" != "x" ]; then
+        echo " "
+        echo " "
+        echo "Are You sure U really want to AGAIN send all $2 records to CloudFlare? (yes/no)"
+        read ODP
+                if [ "$ODP" != "yes" ]; then
+                        echo Not doing anything. Bye
+                        exit 0
+                else
+                        echo Copying all PowerDNS records for $2 domain to Cloudflare Sync Table
+                        domainid=`echo "SELECT id FROM domains WHERE name=\"$2\";" | mysql -u $mysqluser --password=$mysqlpass pdns | sed '1d' `
+                        if [ "x$domainid" == "x" ]; then echo I didnt found any records for domain $2; exit 1; fi
+                        echo "insert into cf_sync_new (domain_id,name,type,content,ttl,prio) select domain_id,name,type,content,ttl,prio from records where domain_id=$domainid;" | mysql -u $mysqluser --password=$mysqlpass pdns
+                        echo Should I now run a sync of this records? If not they will be synced at next script run. You will get e-mail with status. If yes - I will do this immediately, and print here on screen.
+                        echo "(yes/no)"
+                        read ODP2
+                        if [ "$ODP2" != "yes" ]; then
+                                echo Bye.
+                                exit 0
+                        else
+                                add_new_domain_records
+                        fi
+                fi
+        else
+                echo You must specify domain after parameter name
+                exit 1
+        fi
+
+fi
+
+
+if [ "x$1" == "x--check" ]; then
+        if [ "x$2" != "x" ]; then
+        echo Im asking CF server is he handling $2 domain. Will display something only if he is not. Otherwise this should be my only message and its OK
+        check_domain_existance $2
+        exit 0
+        else
+        echo You must specify domain after parameter name
+        exit 1
+        fi
+fi
+
+if [ "x$1" == "x--specified" ]; then
+        if [ "x$2" != "x" ]; then
+        specdomain=$2
+        #echo Running sync for $specdomain only.
+        check_domain_existance $specdomain
+        if [ $? != '0' ]; then
+                create_cf_domain $specdomain
+        fi
+
+        add_new_domain_records $specdomain
+        update_domain_records $specdomain
+        delete_domain_records $specdomain
+
+        if [ "x$changesmade" != "x" ]; then
+        echo Initiating record verification
+        check_domain_synchronization $specdomain
+        fi
+
+
+
+
+        exit 0
+        else
+        echo You must specify domain after parameter name
+        exit 1
+        fi
+fi
+
+
+
+if [ "x$1" == "x--add" ]; then
+add_new_domain_records
+exit 0
+fi
+
+if [ "x$1" == "x--update" ]; then
+update_domain_records
+exit 0
+fi
+
+if [ "x$1" == "x--delete" ]; then
+delete_domain_records
+exit 0
+fi
+
+
+
+
+
+
+
+# Checking do all PowerDNS domains are configured on CloudFlareServers:
+for domain in `get_domains_list`; do
+        check_domain_existance $domain
+        if [ $? != '0' ]; then
+                create_cf_domain $domain
+        fi
+done
+
+add_new_domain_records
+update_domain_records
+delete_domain_records
+
+# Checking for Mis Matches
+if [ "x$changesmade" != "x" ]; then
+echo Initiating record verification
+sleep $syncdelay
+
+for domain in `get_domains_list`; do
+        check_domain_synchronization $domain
+done
+fi
