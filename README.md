@@ -16,7 +16,7 @@ Download this one: https://github.com/dominictarr/JSON.sh and copy it to the sam
 Also Install this one:
 https://github.com/joemiller/dns_compare
 
-After That login to mysql server as root, or pdns database allowed user, use pdns database and Paste this configuration:
+After That login to mysql server as root, or pdns database allowed user, use pdns database (pdns is default, use your name if you use other) and Paste this configuration:
 ```
 CREATE TABLE `cf_sync_new` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
@@ -105,6 +105,7 @@ Additional Options Available:
 --restore-domain domain.com- Restore records of specified domain
 --specified domain.com - Do all the tasks for one domain only, specified one, as a second parameter
 ```
+Normal work - full sync of queued records are done when executed without any parameter.
 
 If You would like to automatically sync your records from PDNS to CF just add script to your crontab
 
