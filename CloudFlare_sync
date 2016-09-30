@@ -39,9 +39,18 @@ function check_domain_existance {
 }
 
 function get_record_id {
+
         domain="$1"
         searchrecord="$2"
         searchtype="$3"
+
+        offset=0
+        WORDCOUNT=20
+
+        if [ ! -e /tmp/searchquery_$domain ]; then
+        echo >/tmp/searchquery_$domain
+
+        until [ $WORDCOUNT -lt 5 ]; do
 
         searchquery=$(curl https://www.cloudflare.com/api_json.html \
                                   -d 'a=rec_load_all' \
@@ -49,31 +58,38 @@ function get_record_id {
                                   -d "email=$apimail" \
                                   -d "z=$domain" \
                                   -d "name=$searchrecord" \
-                                  2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l
-                                )
+                                  -d "o=$offset" \
+                                  2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l)
 
-        if [ "x`echo $searchrecord | grep ^\*`" != "x" ]; then
-                getobjnr=`echo "$searchquery" | grep \"name\" | grep \"\\\\$searchrecord\"$ | cut -d',' -f4`
+                echo "$searchquery" >>/tmp/searchquery_$domain
+                WORDCOUNT=`echo "$searchquery" | wc -l | cut -d' ' -f1`
+                let offset+=180
+
+        done
+        fi
+
+        if [ "x`cat /tmp/searchquery_$domain | grep ^\*`" != "x" ]; then
+                getobjnr=`cat /tmp/searchquery_$domain | grep \"name\" | grep \"\\\\$searchrecord\"$ | cut -d',' -f4`
         else
-                getobjnr=`echo "$searchquery" | grep \"name\" | grep \"$searchrecord\"$ | cut -d',' -f4`
+                getobjnr=`cat /tmp/searchquery_$domain | grep \"name\" | grep \"$searchrecord\"$ | cut -d',' -f4`
         fi
 
 
-        if [ "x$getobjnr" == "x" ]; then echo "FATAL EXCEPTION: NO RECORDS FOUND"; return 1; fi
+       if [ "x$getobjnr" == "x" ]; then echo "DUPA", exit 1 ; fi
 
         while read objnr; do
-                typequery=`echo "$searchquery" | grep ",$objnr,\"type\"" | awk '{print $2}'`
+                typequery=`cat /tmp/searchquery_$domain | grep -B2 ",$objnr,\"type\"" | grep -A2 \"name\" | grep -A2 $searchrecord | grep -v name | awk '{print $2}'`
 
                 if [ "x`echo $typequery | grep $searchtype`" != "x" ]; then
                         if [ `echo $typequery | grep $searchtype | wc -l` -gt '1' ]; then
                                 echo WOOOW, I have multiple ID for the same record!!! ABORTING!!! FUCK!!!
                         else
-                                echo `echo "$searchquery" | grep ,$objnr,\"rec_id\" | awk '{print $2}' | tr -d '"'`
+
+                               echo `cat /tmp/searchquery_$domain | grep -A4 ,$objnr,\"rec_id\" | grep -v -e rec_hash -e zone_name  | grep -B4 ,\"name\" | grep -B2 $searchrecord | grep -v \"name\" | awk '{print $2}' | tr -d '"'`
                         fi
-                fi
+              fi
 
         done <<< "$getobjnr"
-
 
 }
 function add_new_domain_records {
@@ -537,3 +553,4 @@ for domain in `get_domains_list`; do
         check_domain_synchronization $domain
 done
 fi
+rm -f /tmp/searchquery_*
