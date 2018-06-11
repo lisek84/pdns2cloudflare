@@ -4,12 +4,12 @@ cd /etc/powerdns/cloudflare_sync
 
 ## Configuration
 
-mysqluser=`grep gmysql-user /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2`
-mysqlpass=`grep gmysql-password /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2`
+mysqluser=`grep gmysql-user /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2` #Here Goes MYSQL user for PowerDNS, this one gets pass form PDNS config, but feel free to change it to mysqluser="yourUser"
+mysqlpass=`grep gmysql-password /etc/powerdns/pdns.d/pdns.local.gmysql* | cut -d'=' -f2` #Here Goes MYSQL user for PowerDNS, this one gets pass form PDNS config, but feel free to change it to mysqluser="yourPassword"
 apikey="YOUR CLOUDFLARE API GOES HERE"
 apimail="YOUR CLOUDFLARE LOGIN EMAIL GOES HERE"
-syncdelay="60"
-cfservicemode=0 # 0 - Normal, 1 - CF Protected
+syncdelay="60" # Default sync time gap - Feel free to adjust, or use time as parameter when running a script.
+cfservicemode=false # false - Normal, true - CF Protected - Default setting how to create zones and records - Should CF proxy it through their Nginx, or shoult it only be DNS record.
 excludelist="TYPE DOMAINS TO EXCLUDE SYNC HERE. SPACE SEPARATED"
 
 #Internal Configuration, Do not EDIT
@@ -33,65 +33,51 @@ function check_domain_existance {
                 returncode=1
         else
                 domainstatus="OK"
+                #echo "CloudFlare status of domain: $domain is : $domainstatus"
                 returncode=0
         fi
         return $returncode
 }
 
+
+function get_domain_id {
+        domain=$1
+        domainid=""
+        domainidcheck=""
+        domainidcheck=$(curl -X GET "https://api.cloudflare.com/client/v4/zones?name=$domain" -H "X-Auth-Email: $apimail" -H "X-Auth-Key: $apikey" -H "Content-Type: application/json" 2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l | head -n 2 | tr -d '"' | grep -e "^\[result,.*,id]" | awk '{print $2}')
+
+        if [ `echo "$domainidcheck" | wc -l` -lt '1' ]; then
+                domainidstatus="NOT FOUND"
+                echo "CloudFlare id of domain: $domain is : $domainidstatus"
+                returncode=1
+        else
+                domainidstatus="OK"
+                domainid=$domainidcheck
+                echo "$domainid"
+                returncode=0
+        fi
+        return $returncode
+
+
+}
 function get_record_id {
 
         domain="$1"
         searchrecord="$2"
         searchtype="$3"
+        domainid=`get_domain_id $domain`
 
-        offset=0
-        WORDCOUNT=20
+        searchquery=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records?name=$searchrecord&type=$searchtype" -H "X-Auth-Email: $apimail" -H "X-Auth-Key: $apikey" -H "Content-Type: application/json"  | grep -Po '(?<="id":")[^"]*' 2>/dev/null)
 
-        if [ ! -e /tmp/searchquery_$domain ]; then
-        echo >/tmp/searchquery_$domain
+       replycount=${#searchquery}
+       if [ "$replycount" -ne 32 ]; then echo "No Record ID Found/Or Invalid Data"; exit 1 ; fi
+       replylines=`echo $searchquery | wc -l`
+       if [ "$replylines" -gt 1 ]; then echo "WOOOW, I have multiple ID for the same record!!! ABORTING!!! FUCK!!!"; exit 1 ; fi
+        echo $searchquery
 
-        until [ $WORDCOUNT -lt 5 ]; do
-
-        searchquery=$(curl https://www.cloudflare.com/api_json.html \
-                                  -d 'a=rec_load_all' \
-                                  -d "tkn=$apikey" \
-                                  -d "email=$apimail" \
-                                  -d "z=$domain" \
-                                  -d "name=$searchrecord" \
-                                  -d "o=$offset" \
-                                  2>/dev/null | /etc/powerdns/cloudflare_sync/JSON.sh -l)
-
-                echo "$searchquery" >>/tmp/searchquery_$domain
-                WORDCOUNT=`echo "$searchquery" | wc -l | cut -d' ' -f1`
-                let offset+=180
-
-        done
-        fi
-
-        if [ "x`cat /tmp/searchquery_$domain | grep ^\*`" != "x" ]; then
-                getobjnr=`cat /tmp/searchquery_$domain | grep \"name\" | grep \"\\\\$searchrecord\"$ | cut -d',' -f4`
-        else
-                getobjnr=`cat /tmp/searchquery_$domain | grep \"name\" | grep \"$searchrecord\"$ | cut -d',' -f4`
-        fi
-
-
-       if [ "x$getobjnr" == "x" ]; then echo "DUPA", exit 1 ; fi
-
-        while read objnr; do
-                typequery=`cat /tmp/searchquery_$domain | grep -B2 ",$objnr,\"type\"" | grep -A2 \"name\" | grep -A2 $searchrecord | grep -v name | awk '{print $2}'`
-
-                if [ "x`echo $typequery | grep $searchtype`" != "x" ]; then
-                        if [ `echo $typequery | grep $searchtype | wc -l` -gt '1' ]; then
-                                echo WOOOW, I have multiple ID for the same record!!! ABORTING!!! FUCK!!!
-                        else
-
-                               echo `cat /tmp/searchquery_$domain | grep -A4 ,$objnr,\"rec_id\" | grep -v -e rec_hash -e zone_name  | grep -B4 ,\"name\" | grep -B2 $searchrecord | grep -v \"name\" | awk '{print $2}' | tr -d '"'`
-                        fi
-              fi
-
-        done <<< "$getobjnr"
 
 }
+
 function add_new_domain_records {
 
         if [ "x$1" != "x" ]; then
@@ -130,20 +116,23 @@ if [ "x$getnewaddjobs" != "x" ]; then
 
 
                 echo "Synchronizing $domain_name records with CloudFlare servers. Syncing NEW record: $record_name $record_type $record_content $record_ttl $record_prio"
-                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
-                                  -d 'a=rec_new' \
-                                  -d "tkn=$apikey" \
-                                  -d "email=$apimail" \
-                                  -d "z=$domain_name" \
-                                  -d "type=$record_type" \
-                                  -d "name=$record_name" \
-                                  -d "content=$record_content" \
-                                  -d "ttl=$record_ttl" \
-                                  -d "service_mode=$cfservicemode" \
-                                  -d "prio=$record_prio" 2>/dev/null
+
+                domainid=`get_domain_id $domain_name`
+                statusresult=$(curl -X POST "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records" \
+                                  -H "X-Auth-Email: $apimail" \
+                                  -H  "X-Auth-Key: $apikey" \
+                                  -H "Content-Type: application/json" \
+                                  --data "{
+                                      \"type\": \"$record_type\",
+                                      \"name\": \"$record_name\",
+                                      \"content\": \"$record_content\",
+                                      \"ttl\": \"$record_ttl\",
+                                      \"priority\": \"$record_prio\",
+                                      \"proxied\": $cfservicemode
+                                  }" 2>/dev/null
                                 )
 
-                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                if [ "x`echo $statusresult | tr -d '"' | grep 'success:true'`" != "x" ]; then
                         echo Record Added Successfully
                         echo "DELETE FROM cf_sync_new WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
                 else
@@ -193,31 +182,33 @@ if [ "x$getnewupdjobs" != "x" ]; then
                 fi
 
                 cf_record_id=`get_record_id $domain_name $record_name $record_type`
-
+                domainid=`get_domain_id $domain_name`
 
 
                 echo "Synchronizing $domain_name records with CloudFlare servers. Syncing UPDATED record $cf_record_id : $record_name $record_type $record_content $record_ttl $record_prio"
-                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
-                                  -d 'a=rec_edit' \
-                                  -d "tkn=$apikey" \
-                                  -d "email=$apimail" \
-                                  -d "id=$cf_record_id" \
-                                  -d "z=$domain_name" \
-                                  -d "type=$record_type" \
-                                  -d "name=$record_name" \
-                                  -d "content=$record_content" \
-                                  -d "ttl=$record_ttl" \
-                                  -d "service_mode=$cfservicemode" \
-                                  -d "prio=$record_prio" 2>/dev/null
+
+                statusresult=$(curl -X PUT "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records/$cf_record_id" \
+                                  -H "X-Auth-Email: $apimail" \
+                                  -H "X-Auth-Key: $apikey" \
+                                  -H "Content-Type: application/json" \
+                                  --data "{
+                                      \"type\": \"$record_type\",
+                                      \"name\": \"$record_name\",
+                                      \"content\": \"$record_content\",
+                                      \"ttl\": \"$record_ttl\",
+                                      \"priority\": \"$record_prio\"}" 2>/dev/null
                                 )
 
-                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                if [ "x`echo $statusresult | tr -d '"' | grep 'success:true'`" != "x" ]; then
                         echo Record Updated Successfully
                         echo "DELETE FROM cf_sync_updated WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
                 else
                         echo Record Updating FAILED!!!! SEE WHAT IS WRONG:
                         echo "$statusresult"
                 fi
+
+
+
 
 
         done <<< "$getnewupdjobs"
@@ -266,25 +257,25 @@ if [ "x$getdeljobs" != "x" ]; then
 
 
                 cf_record_id=`get_record_id $domain_name $record_name $record_type`
+                domainid=`get_domain_id $domain_name`
 
 
+                echo "Synchronizing $domain_name records with CloudFlare servers. Removing record $cf_record_id : $record_name $record_type"
 
-                echo "Synchronizing $domain_name records with CloudFlare servers. Removing Record $cf_record_id : $record_name $record_type"
-                        statusresult=$(curl https://www.cloudflare.com/api_json.html \
-                                  -d 'a=rec_delete' \
-                                  -d "tkn=$apikey" \
-                                  -d "email=$apimail" \
-                                  -d "id=$cf_record_id" \
-                                  -d "z=$domain_name" 2>/dev/null
+                statusresult=$(curl -X DELETE "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records/$cf_record_id" \
+                                  -H "X-Auth-Email: $apimail" \
+                                  -H "X-Auth-Key: $apikey" \
+                                  -H "Content-Type: application/json" 2>/dev/null
                                 )
 
-                if [ "x`echo $statusresult | grep success`" != "x" ]; then
+                if [ "x`echo $statusresult | tr -d '"' | grep 'success:true'`" != "x" ]; then
                         echo Record Deleted Successfully
                         echo "DELETE FROM cf_sync_deleted WHERE id="$record_id";" | mysql -u $mysqluser --password=$mysqlpass pdns
                 else
                         echo Record Removal FAILED!!!! SEE WHAT IS WRONG:
                         echo "$statusresult"
                 fi
+
 
 
         done <<< "$getdeljobs"
@@ -325,7 +316,7 @@ function create_cf_domain {
         fi
 }
 
-# Obsluga linii polecen:
+# Command line support
 
 if [ "x$1" == "x--help" ]; then
 echo CloudFlare Synchronization Script
@@ -337,7 +328,7 @@ echo --help - Shows this help screen
 echo --compare domain.com - Checks domain.com for MIS-MATCHES between our, and CloudFlare server.
 echo --compare-all - Checks all domains for MIS-MATCHES. You can add second parameter for delay time between checks per domain
 echo --check domain.com - Checks if domain.com is properly handled by CF servers
-echo --flush-queue - Removes all pending operations queued in mysql, You can add second parameter with domain name to delete only queue for this domain
+echo --flush-queue - Removes all pending operations queued in mysql, You can add second parameter with domain name to delete only queue for this domain. Add --forced as second parameter for \"no-ask\" clearing
 echo --show-queue - Show all pending operations stored in mysql
 echo --add - Runs only adding new Records to CF servers
 echo --update - Runs only updating Records on CF servers
@@ -351,6 +342,14 @@ fi
 
 
 if [ "x$1" == "x--flush-queue" ]; then
+
+        if [ "x$2" == "x--forced" ]; then
+         echo "DELETE FROM cf_sync_new;" | mysql -u $mysqluser --password=$mysqlpass pdns
+         echo "DELETE FROM cf_sync_updated;" | mysql -u $mysqluser --password=$mysqlpass pdns
+         echo "DELETE FROM cf_sync_deleted;" | mysql -u $mysqluser --password=$mysqlpass pdns
+         exit 0
+        fi
+
 echo " "
 echo " "
 echo "Are You sure U really want to flush all pending operations? (yes/no)"
@@ -553,4 +552,3 @@ for domain in `get_domains_list`; do
         check_domain_synchronization $domain
 done
 fi
-rm -f /tmp/searchquery_*
