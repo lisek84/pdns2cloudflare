@@ -116,7 +116,7 @@ if [ "x$getnewaddjobs" != "x" ]; then
 
 
                 echo "Synchronizing $domain_name records with CloudFlare servers. Syncing NEW record: $record_name $record_type $record_content $record_ttl $record_prio"
-
+                record_content=`echo $record_content | sed -e 's/^"//' -e 's/"$//'`
                 domainid=`get_domain_id $domain_name`
                 statusresult=$(curl -X POST "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records" \
                                   -H "X-Auth-Email: $apimail" \
@@ -126,8 +126,8 @@ if [ "x$getnewaddjobs" != "x" ]; then
                                       \"type\": \"$record_type\",
                                       \"name\": \"$record_name\",
                                       \"content\": \"$record_content\",
-                                      \"ttl\": \"$record_ttl\",
-                                      \"priority\": \"$record_prio\",
+                                      \"ttl\": $record_ttl,
+                                      \"priority\": $record_prio,
                                       \"proxied\": $cfservicemode
                                   }" 2>/dev/null
                                 )
@@ -186,7 +186,7 @@ if [ "x$getnewupdjobs" != "x" ]; then
 
 
                 echo "Synchronizing $domain_name records with CloudFlare servers. Syncing UPDATED record $cf_record_id : $record_name $record_type $record_content $record_ttl $record_prio"
-
+                record_content=`echo $record_content | sed -e 's/^"//' -e 's/"$//'`
                 statusresult=$(curl -X PUT "https://api.cloudflare.com/client/v4/zones/$domainid/dns_records/$cf_record_id" \
                                   -H "X-Auth-Email: $apimail" \
                                   -H "X-Auth-Key: $apikey" \
@@ -195,8 +195,8 @@ if [ "x$getnewupdjobs" != "x" ]; then
                                       \"type\": \"$record_type\",
                                       \"name\": \"$record_name\",
                                       \"content\": \"$record_content\",
-                                      \"ttl\": \"$record_ttl\",
-                                      \"priority\": \"$record_prio\"}" 2>/dev/null
+                                      \"ttl\": $record_ttl,
+                                      \"priority\": $record_prio}" 2>/dev/null
                                 )
 
                 if [ "x`echo $statusresult | tr -d '"' | grep 'success:true'`" != "x" ]; then
